@@ -1,0 +1,43 @@
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -354,6 +354,12 @@
+    if (!bo->ptr.cpu)
+       return;
+ 
++   if (drmKbaseIsBOMapping &&
++       drmKbaseIsBOMapping((void *)(uintptr_t)bo->ptr.cpu)) {
++      bo->ptr.cpu = NULL;
++      return;
++   }
++
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       perror("munmap");
+       abort();
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -602,6 +602,10 @@
+    return true;
+ }
+ 
++/* Provided by libdrm-kbase only; NULL with regular libdrm. */
++extern void *drmKbaseMapBO(int fd, uint64_t offset) __attribute__((weak));
++extern int drmKbaseIsBOMapping(void *addr) __attribute__((weak));
++
+ static inline void *
+ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, off_t bo_offset, size_t size, int prot,
+                  int flags, void *host_addr)
+@@ -615,6 +619,14 @@
+    if (mmap_offset < 0)
+       return MAP_FAILED;
+ 
++   /* libdrm-kbase: BOs are kbase SAME_VA allocations, already mapped with
++    * CPU VA == GPU VA; the "offset" is that address. */
++   if (drmKbaseMapBO) {
++      void *p = drmKbaseMapBO(bo->dev->fd, mmap_offset);
++      if (p)
++         return (char *)p + bo_offset;
++   }
++
+    host_addr = os_mmap(host_addr, size, prot, flags, bo->dev->fd,
+                        mmap_offset + bo_offset);
+    if (host_addr == MAP_FAILED)

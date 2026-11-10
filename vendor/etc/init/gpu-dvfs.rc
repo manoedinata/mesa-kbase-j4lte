@@ -1,0 +1,14 @@
+# Mali-T720 DVFS floor for Mesa/Panfrost on kbase.
+# The stock interactive table only steps up from 415 MHz above 98% util;
+# the synchronous drm-kbase submit path never reaches that, so the GPU
+# idled at 350/415 MHz while frames took 50+ ms (launcher p50 frame:
+# 57 ms stock, 48 ms at a 553 floor, 32 ms at 830; 553-830 are all
+# 900 mV in the stock table). Valid levels:
+# 350 415 553 666 830; 0 removes the floor.
+# Runtime A/B from adb shell: setprop debug.gpu.min_lock 830
+
+on boot
+    write /sys/devices/11400000.mali/dvfs_min_lock 830
+
+on property:debug.gpu.min_lock=*
+    write /sys/devices/11400000.mali/dvfs_min_lock ${debug.gpu.min_lock}

@@ -1,0 +1,684 @@
+--- a/src/drm-shim/device.c
++++ b/src/drm-shim/device.c
+@@ -371,15 +371,21 @@
+ void
+ drm_shim_bo_put(struct shim_bo *bo)
+ {
+-   if (p_atomic_dec_return(&bo->refcount) == 0)
++   if (p_atomic_dec_return(&bo->refcount) != 0)
+       return;
+ 
++   mtx_lock(&shim_device.mem_lock);
++   _mesa_hash_table_u64_remove(shim_device.offset_map, bo->mem_addr);
++   mtx_unlock(&shim_device.mem_lock);
++
+    if (shim_device.driver_bo_free)
+       shim_device.driver_bo_free(bo);
+ 
+-   mtx_lock(&shim_device.mem_lock);
+-   util_vma_heap_free(&shim_device.mem_heap, bo->mem_addr, bo->size);
+-   mtx_unlock(&shim_device.mem_lock);
++   if (!bo->map) {
++      mtx_lock(&shim_device.mem_lock);
++      util_vma_heap_free(&shim_device.mem_heap, bo->mem_addr, bo->size);
++      mtx_unlock(&shim_device.mem_lock);
++   }
+    free(bo);
+ }
+ 
+@@ -449,8 +455,24 @@
+    if (length > bo->size)
+       return MAP_FAILED;
+ 
++   /* Driver-owned mapping (CPU VA == GPU VA): hand back the existing one. */
++   if (bo->map)
++      return bo->map;
++
+    /* The offset we pass to mmap must be aligned to the page size */
+    assert((bo->mem_addr & (shim_page_size - 1)) == 0);
+ 
+    return mmap(NULL, length, prot, flags, shim_device.mem_fd, bo->mem_addr);
+ }
++
++bool
++drm_shim_bo_is_driver_mapping(void *addr)
++{
++   if (!shim_device.offset_map)
++      return false;
++   mtx_lock(&shim_device.mem_lock);
++   struct shim_bo *bo =
++      _mesa_hash_table_u64_search(shim_device.offset_map, (uintptr_t)addr);
++   mtx_unlock(&shim_device.mem_lock);
++   return bo && bo->map == addr;
++}
+--- a/src/drm-shim/drm_shim.c
++++ b/src/drm-shim/drm_shim.c
+@@ -75,6 +75,7 @@
+ REAL_FUNCTION_POINTER(ioctl);
+ REAL_FUNCTION_POINTER(mmap);
+ REAL_FUNCTION_POINTER(mmap64);
++REAL_FUNCTION_POINTER(munmap);
+ REAL_FUNCTION_POINTER(open);
+ REAL_FUNCTION_POINTER(opendir);
+ REAL_FUNCTION_POINTER(readdir);
+@@ -229,6 +230,7 @@
+    GET_FUNCTION_POINTER(ioctl);
+    GET_FUNCTION_POINTER(mmap);
+    GET_FUNCTION_POINTER(mmap64);
++   GET_FUNCTION_POINTER(munmap);
+    GET_FUNCTION_POINTER(open);
+    GET_FUNCTION_POINTER(opendir);
+    GET_FUNCTION_POINTER(readdir);
+@@ -853,3 +855,25 @@
+ 
+    return real_mmap64(addr, length, prot, flags, fd, offset);
+ }
++
++/* BOs whose memory the driver mapped itself (bo->map set, e.g. kbase SAME_VA)
++ * are handed out by drm_shim_mmap() as-is, so a munmap() of them must not tear
++ * the mapping down; the driver frees it in driver_bo_free.
++ */
++PUBLIC int
++munmap(void *addr, size_t length)
++{
++   init_shim();
++
++   if (drm_shim_bo_is_driver_mapping(addr))
++      return 0;
++
++   return real_munmap(addr, length);
++}
++
++int
++drm_shim_real_munmap(void *addr, size_t length)
++{
++   init_shim();
++   return real_munmap(addr, length);
++}
+--- a/src/drm-shim/drm_shim.h
++++ b/src/drm-shim/drm_shim.h
+@@ -102,6 +102,8 @@
+                     int fd, off64_t offset);
+ 
+ int drm_shim_bo_init(struct shim_bo *bo, size_t size);
++bool drm_shim_bo_is_driver_mapping(void *addr);
++int drm_shim_real_munmap(void *addr, size_t length);
+ void drm_shim_bo_get(struct shim_bo *bo);
+ void drm_shim_bo_put(struct shim_bo *bo);
+ struct shim_bo *drm_shim_bo_lookup(struct shim_fd *shim_fd, int handle);
+--- a/src/panfrost/drm-shim/meson.build
++++ b/src/panfrost/drm-shim/meson.build
+@@ -9,3 +9,12 @@
+   gnu_symbol_visibility : 'hidden',
+   install : true,
+ )
++
++libpanfrost_kbase_drm_shim = shared_library(
++  'panfrost_kbase_drm_shim',
++  'panfrost_kbase.c',
++  include_directories: [inc_include, inc_src],
++  dependencies: dep_drm_shim,
++  gnu_symbol_visibility : 'hidden',
++  install : true,
++)
+--- a/src/panfrost/drm-shim/panfrost_kbase.c
++++ b/src/panfrost/drm-shim/panfrost_kbase.c
+@@ -0,0 +1,558 @@
++/*
++ * panfrost DRM UAPI emulated on top of Arm's kbase (Midgard r29p0, UK 11.13).
++ *
++ * LD_PRELOAD this together with Mesa's panfrost Gallium driver: Mesa thinks it
++ * talks to /dev/dri/renderD128 (panfrost.ko); every ioctl lands here and is
++ * translated into /dev/mali0 calls.
++ *
++ * Prototype simplifications:
++ *  - every SUBMIT is synchronous (submit atom, block on the kbase event), so
++ *    syncobjs/WAIT_BO are always "signalled";
++ *  - BOs are kbase SAME_VA allocations: CPU address == GPU address, mapped
++ *    once at creation and handed back on every mmap of the BO;
++ *  - mappings are placed below 4 GiB because Mesa's panfrost VM assumes
++ *    32-bit GPU VAs.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include "drm-shim/drm_shim.h"
++#include "drm-uapi/panfrost_drm.h"
++#include "util/u_math.h"
++
++/* ---- kbase r29p0 UAPI (from drivers/gpu/arm/t72x/r29p0) ---------------- */
++
++#define KBASE_IOCTL_TYPE 0x80
++
++struct kbase_ioctl_version_check { uint16_t major, minor; };
++struct kbase_ioctl_set_flags { uint32_t create_flags; };
++struct kbase_ioctl_job_submit { uint64_t addr; uint32_t nr_atoms, stride; };
++struct kbase_ioctl_get_gpuprops { uint64_t buffer; uint32_t size, flags; };
++union kbase_ioctl_mem_alloc {
++   struct { uint64_t va_pages, commit_pages, extent, flags; } in;
++   struct { uint64_t flags, gpu_va; } out;
++};
++struct kbase_ioctl_mem_free { uint64_t gpu_addr; };
++
++#define KBASE_IOCTL_VERSION_CHECK _IOWR(KBASE_IOCTL_TYPE, 0, struct kbase_ioctl_version_check)
++#define KBASE_IOCTL_SET_FLAGS     _IOW(KBASE_IOCTL_TYPE, 1, struct kbase_ioctl_set_flags)
++#define KBASE_IOCTL_JOB_SUBMIT    _IOW(KBASE_IOCTL_TYPE, 2, struct kbase_ioctl_job_submit)
++#define KBASE_IOCTL_GET_GPUPROPS  _IOW(KBASE_IOCTL_TYPE, 3, struct kbase_ioctl_get_gpuprops)
++#define KBASE_IOCTL_MEM_ALLOC     _IOWR(KBASE_IOCTL_TYPE, 5, union kbase_ioctl_mem_alloc)
++#define KBASE_IOCTL_MEM_FREE      _IOW(KBASE_IOCTL_TYPE, 7, struct kbase_ioctl_mem_free)
++
++#define BASE_MEM_PROT_CPU_RD (1ull << 0)
++#define BASE_MEM_PROT_CPU_WR (1ull << 1)
++#define BASE_MEM_PROT_GPU_RD (1ull << 2)
++#define BASE_MEM_PROT_GPU_WR (1ull << 3)
++#define BASE_MEM_PROT_GPU_EX (1ull << 4)
++#define BASE_MEM_GROW_ON_GPF (1ull << 9)
++#define BASE_MEM_SAME_VA     (1ull << 13)
++
++#define BASE_JD_REQ_FS             (1u << 0)
++#define BASE_JD_REQ_CS             (1u << 1)
++#define BASE_JD_REQ_T              (1u << 2)
++#define BASE_JD_REQ_COHERENT_GROUP (1u << 6)
++
++#define BASE_JD_EVENT_DONE 0x01
++
++struct base_jd_udata { uint64_t blob[2]; };
++struct base_dependency { uint8_t atom_id, dependency_type; };
++
++/* Samsung's r29p0 appends SRUK systrace fields: 64 bytes on arm64, and the
++ * kernel rejects any other stride. */
++struct base_jd_atom_v2 {
++   uint64_t jc;
++   struct base_jd_udata udata;
++   uint64_t extres_list;
++   uint16_t nr_extres;
++   uint16_t compat_core_req;
++   struct base_dependency pre_dep[2];
++   uint8_t atom_number;
++   uint8_t prio;
++   uint8_t device_nr;
++   uint8_t padding[1];
++   uint32_t core_req;
++   uint32_t gles_ctx_handle;
++   uint32_t frame_number;
++   uint64_t surfacep;
++};
++_Static_assert(sizeof(struct base_jd_atom_v2) == 64, "atom size");
++
++struct base_jd_event_v2 {
++   uint32_t event_code;
++   uint8_t atom_number;
++   struct base_jd_udata udata;
++};
++
++/* gpuprops keys (key << 2 | size) */
++enum {
++   KP_RAW_SHADER_PRESENT = 25, KP_RAW_TILER_PRESENT = 26, KP_RAW_L2_PRESENT = 27,
++   KP_RAW_STACK_PRESENT = 28, KP_RAW_L2_FEATURES = 29, KP_RAW_CORE_FEATURES = 30,
++   KP_RAW_MEM_FEATURES = 31, KP_RAW_MMU_FEATURES = 32, KP_RAW_AS_PRESENT = 33,
++   KP_RAW_JS_PRESENT = 34, KP_RAW_JS_FEATURES_0 = 35, KP_RAW_TILER_FEATURES = 51,
++   KP_RAW_TEXTURE_FEATURES_0 = 52, KP_RAW_GPU_ID = 55, KP_RAW_THREAD_MAX_THREADS = 56,
++   KP_RAW_THREAD_MAX_WORKGROUP_SIZE = 57, KP_RAW_THREAD_MAX_BARRIER_SIZE = 58,
++   KP_RAW_THREAD_FEATURES = 59, KP_RAW_COHERENCY_MODE = 60,
++   KP_MAX = 128,
++};
++
++/* ---- state -------------------------------------------------------------- */
++
++static int kfd = -1;
++static uint64_t props[KP_MAX];
++static uint8_t next_atom = 1;
++static int debug;
++
++struct kbase_bo {
++   struct shim_bo base;
++   uint64_t gpu_va;
++   size_t size;
++};
++
++#define dbg(...) do { if (debug) fprintf(stderr, "kbase-shim: " __VA_ARGS__); } while (0)
++
++static int
++kbase_open(void)
++{
++   if (kfd >= 0)
++      return 0;
++
++   debug = getenv("KBASE_SHIM_DEBUG") != NULL;
++   kfd = open("/dev/mali0", O_RDWR | O_CLOEXEC);
++   if (kfd < 0) {
++      perror("kbase-shim: open /dev/mali0");
++      return -1;
++   }
++
++   struct kbase_ioctl_version_check ver = { 11, 13 };
++   if (ioctl(kfd, KBASE_IOCTL_VERSION_CHECK, &ver) < 0) {
++      perror("kbase-shim: VERSION_CHECK");
++      return -1;
++   }
++   dbg("kbase UK %u.%u\n", ver.major, ver.minor);
++
++   struct kbase_ioctl_set_flags fl = { 0 };
++   if (ioctl(kfd, KBASE_IOCTL_SET_FLAGS, &fl) < 0) {
++      perror("kbase-shim: SET_FLAGS");
++      return -1;
++   }
++
++   /* kbase picks SAME_VA addresses top-down below its zone end (2^33 on
++    * T720) and refuses hints. The T720 tiler path loses addresses >= 4 GiB,
++    * so park an inaccessible reservation over [4 GiB, 8 GiB) to push every
++    * BO below 4 GiB, matching what panfrost.ko does. */
++   void *resv = mmap((void *)(1ull << 32), 1ull << 32, PROT_NONE,
++                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
++                     -1, 0);
++   if (resv == MAP_FAILED)
++      perror("kbase-shim: reserving [4G,8G)");
++
++   /* kbase refuses MEM_ALLOC until the tracking page is mapped (this binds
++    * the context to our mm). */
++   void *track = mmap(NULL, 4096, PROT_NONE, MAP_SHARED, kfd, 3ull << 12);
++   if (track == MAP_FAILED) {
++      perror("kbase-shim: tracking page mmap");
++      return -1;
++   }
++
++   uint8_t buf[4096];
++   struct kbase_ioctl_get_gpuprops gp = { (uintptr_t)buf, sizeof(buf), 0 };
++   int n = ioctl(kfd, KBASE_IOCTL_GET_GPUPROPS, &gp);
++   if (n < 0) {
++      perror("kbase-shim: GET_GPUPROPS");
++      return -1;
++   }
++   for (int i = 0; i + 4 <= n;) {
++      uint32_t key;
++      memcpy(&key, buf + i, 4);
++      i += 4;
++      unsigned sz = 1u << (key & 3);
++      uint64_t v = 0;
++      memcpy(&v, buf + i, sz);
++      i += sz;
++      if ((key >> 2) < KP_MAX)
++         props[key >> 2] = v;
++   }
++   dbg("GPU_ID %#llx shader_present %#llx\n",
++       (unsigned long long)props[KP_RAW_GPU_ID],
++       (unsigned long long)props[KP_RAW_SHADER_PRESENT]);
++   return 0;
++}
++
++/* ---- ioctls ------------------------------------------------------------- */
++
++static int
++kb_get_param(int fd, unsigned long request, void *arg)
++{
++   struct drm_panfrost_get_param *gp = arg;
++   uint64_t id = props[KP_RAW_GPU_ID];
++
++   switch (gp->param) {
++   case DRM_PANFROST_PARAM_GPU_PROD_ID:     gp->value = id >> 16; return 0;
++   case DRM_PANFROST_PARAM_GPU_REVISION:    gp->value = id & 0xffff; return 0;
++   case DRM_PANFROST_PARAM_SHADER_PRESENT:  gp->value = props[KP_RAW_SHADER_PRESENT]; return 0;
++   case DRM_PANFROST_PARAM_TILER_PRESENT:   gp->value = props[KP_RAW_TILER_PRESENT]; return 0;
++   case DRM_PANFROST_PARAM_L2_PRESENT:      gp->value = props[KP_RAW_L2_PRESENT]; return 0;
++   case DRM_PANFROST_PARAM_STACK_PRESENT:   gp->value = props[KP_RAW_STACK_PRESENT]; return 0;
++   case DRM_PANFROST_PARAM_AS_PRESENT:      gp->value = props[KP_RAW_AS_PRESENT]; return 0;
++   case DRM_PANFROST_PARAM_JS_PRESENT:      gp->value = props[KP_RAW_JS_PRESENT]; return 0;
++   case DRM_PANFROST_PARAM_L2_FEATURES:     gp->value = props[KP_RAW_L2_FEATURES]; return 0;
++   case DRM_PANFROST_PARAM_CORE_FEATURES:   gp->value = props[KP_RAW_CORE_FEATURES]; return 0;
++   case DRM_PANFROST_PARAM_TILER_FEATURES:  gp->value = props[KP_RAW_TILER_FEATURES]; return 0;
++   case DRM_PANFROST_PARAM_MEM_FEATURES:    gp->value = props[KP_RAW_MEM_FEATURES]; return 0;
++   case DRM_PANFROST_PARAM_MMU_FEATURES:    gp->value = props[KP_RAW_MMU_FEATURES]; return 0;
++   case DRM_PANFROST_PARAM_THREAD_FEATURES: gp->value = props[KP_RAW_THREAD_FEATURES]; return 0;
++   case DRM_PANFROST_PARAM_MAX_THREADS:     gp->value = props[KP_RAW_THREAD_MAX_THREADS]; return 0;
++   case DRM_PANFROST_PARAM_THREAD_MAX_WORKGROUP_SZ:
++      gp->value = props[KP_RAW_THREAD_MAX_WORKGROUP_SIZE]; return 0;
++   case DRM_PANFROST_PARAM_THREAD_MAX_BARRIER_SZ:
++      gp->value = props[KP_RAW_THREAD_MAX_BARRIER_SIZE]; return 0;
++   case DRM_PANFROST_PARAM_COHERENCY_FEATURES:
++      gp->value = props[KP_RAW_COHERENCY_MODE]; return 0;
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES0:
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES1:
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES2:
++      gp->value = props[KP_RAW_TEXTURE_FEATURES_0 + gp->param -
++                        DRM_PANFROST_PARAM_TEXTURE_FEATURES0];
++      return 0;
++   case DRM_PANFROST_PARAM_TEXTURE_FEATURES3:
++   case DRM_PANFROST_PARAM_THREAD_TLS_ALLOC:
++   case DRM_PANFROST_PARAM_AFBC_FEATURES:
++      gp->value = 0; return 0;
++   case DRM_PANFROST_PARAM_NR_CORE_GROUPS:
++      gp->value = 1; return 0;
++   case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY: {
++      uint64_t f;
++      __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
++      gp->value = f; return 0;
++   }
++   case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP: {
++      uint64_t t;
++      __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
++      gp->value = t; return 0;
++   }
++   default:
++      if (gp->param >= DRM_PANFROST_PARAM_JS_FEATURES0 &&
++          gp->param <= DRM_PANFROST_PARAM_JS_FEATURES15) {
++         gp->value = props[KP_RAW_JS_FEATURES_0 + gp->param -
++                           DRM_PANFROST_PARAM_JS_FEATURES0];
++         return 0;
++      }
++      fprintf(stderr, "kbase-shim: unknown GET_PARAM %u\n", gp->param);
++      errno = EINVAL;
++      return -1;
++   }
++}
++
++static int
++kb_create_bo(int fd, unsigned long request, void *arg)
++{
++   struct drm_panfrost_create_bo *create = arg;
++   size_t size = ALIGN(create->size, 4096);
++   uint64_t pages = size / 4096;
++   uint64_t flags = BASE_MEM_SAME_VA | BASE_MEM_PROT_GPU_RD;
++   uint64_t commit = pages, extent = 0;
++
++   if (create->flags & PANFROST_BO_HEAP) {
++      /* Growable tiler heap: GPU-only, grows on GPU page fault. */
++      flags |= BASE_MEM_PROT_GPU_WR | BASE_MEM_GROW_ON_GPF |
++               BASE_MEM_PROT_CPU_RD;
++      commit = MIN2(pages, 64);
++      extent = 64;
++   } else if (create->flags & PANFROST_BO_NOEXEC) {
++      flags |= BASE_MEM_PROT_GPU_WR | BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR;
++   } else {
++      /* Executable: kbase forbids GPU_EX together with GPU_WR. */
++      flags |= BASE_MEM_PROT_GPU_EX | BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR;
++   }
++
++   union kbase_ioctl_mem_alloc a = { .in = { pages, commit, extent, flags } };
++   if (ioctl(kfd, KBASE_IOCTL_MEM_ALLOC, &a) < 0) {
++      fprintf(stderr, "kbase-shim: MEM_ALLOC %zu bytes flags %#llx: %s\n",
++              size, (unsigned long long)flags, strerror(errno));
++      return -1;
++   }
++
++   /* SAME_VA: gpu_va is a cookie; mmap() of it fixes CPU VA == GPU VA. */
++   int prot = (flags & BASE_MEM_PROT_CPU_WR) ? PROT_READ | PROT_WRITE : PROT_READ;
++   void *p = mmap(NULL, size, prot, MAP_SHARED,
++                  kfd, a.out.gpu_va);
++   if (p == MAP_FAILED) {
++      fprintf(stderr, "kbase-shim: mmap cookie %#llx: %s\n",
++              (unsigned long long)a.out.gpu_va, strerror(errno));
++      return -1;
++   }
++
++   if ((uintptr_t)p + size > (1ull << 32))
++      fprintf(stderr, "kbase-shim: WARNING BO at %p above 4 GiB\n", p);
++
++   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
++   struct kbase_bo *bo = calloc(1, sizeof(*bo));
++   bo->base.mem_addr = (uintptr_t)p;
++   bo->base.map = p;
++   bo->base.size = size;
++   bo->gpu_va = (uintptr_t)p;
++   bo->size = size;
++   bo->base.refcount = 1; /* creation ref, dropped below */
++
++   create->handle = drm_shim_bo_get_handle(shim_fd, &bo->base);
++   create->offset = bo->gpu_va;
++   drm_shim_bo_put(&bo->base);
++
++   dbg("BO %u size %zu flags %#x -> va %p\n", create->handle, size,
++       create->flags, p);
++   return 0;
++}
++
++static void
++kb_bo_free(struct shim_bo *sbo)
++{
++   struct kbase_bo *bo = (struct kbase_bo *)sbo;
++   dbg("free BO va %#llx\n", (unsigned long long)bo->gpu_va);
++   drm_shim_real_munmap(sbo->map, bo->size);
++   struct kbase_ioctl_mem_free f = { bo->gpu_va };
++   ioctl(kfd, KBASE_IOCTL_MEM_FREE, &f);
++}
++
++static int
++kb_mmap_bo(int fd, unsigned long request, void *arg)
++{
++   struct drm_panfrost_mmap_bo *mmap_bo = arg;
++   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
++   struct shim_bo *bo = drm_shim_bo_lookup(shim_fd, mmap_bo->handle);
++   if (!bo) {
++      errno = ENOENT;
++      return -1;
++   }
++   mmap_bo->offset = drm_shim_bo_get_mmap_offset(shim_fd, bo);
++   drm_shim_bo_put(bo);
++   return 0;
++}
++
++static int
++kb_get_bo_offset(int fd, unsigned long request, void *arg)
++{
++   struct drm_panfrost_get_bo_offset *g = arg;
++   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
++   struct shim_bo *bo = drm_shim_bo_lookup(shim_fd, g->handle);
++   if (!bo) {
++      errno = ENOENT;
++      return -1;
++   }
++   g->offset = bo->mem_addr;
++   drm_shim_bo_put(bo);
++   return 0;
++}
++
++/* KBASE_SHIM_PEEK="addr:len,addr:len": hexdump GPU VAs (== CPU VAs) after
++ * every atom; only addresses that belong to a mapped BO are touched. */
++static void
++peek(const char *what)
++{
++   const char *e = getenv("KBASE_SHIM_PEEK");
++   if (!e)
++      return;
++   char buf[512];
++   snprintf(buf, sizeof(buf), "%s", e);
++   for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
++      unsigned long long a = strtoull(t, NULL, 16);
++      char *c = strchr(t, ':');
++      unsigned len = c ? strtoul(c + 1, NULL, 0) : 32;
++      if (msync((void *)(uintptr_t)(a & ~0xfffull), 4096, MS_ASYNC) != 0)
++         continue;
++      fprintf(stderr, "peek after %s @%llx:", what, a);
++      const uint32_t *w = (const uint32_t *)(uintptr_t)a;
++      for (unsigned i = 0; i < len / 4; i++)
++         fprintf(stderr, "%s%08x", i % 4 ? " " : "\n   ", w[i]);
++      fprintf(stderr, "\n");
++   }
++}
++
++static int submit_one(uint64_t jc, uint32_t reqs);
++
++/* Midgard job header: +0x10 bit0 desc size, bits1-7 type; +0x12 index,
++ * +0x14 dep1, +0x16 dep2; +0x18 next (64-bit descriptors).
++ *
++ * Under kbase a tiler job does not see the vertex job's output when both run
++ * in one hardware job chain (works on panfrost.ko; root cause unknown). So
++ * every job of a non-fragment chain becomes its own atom, chained with kbase
++ * data dependencies, submitted in one ioctl; we wait for the last one. */
++#define MAX_SPLIT 255
++static int
++submit_split(uint64_t jc, uint32_t reqs)
++{
++   static struct base_jd_atom_v2 atoms[MAX_SPLIT];
++   static struct { volatile uint8_t *h; uint64_t next; uint16_t d1, d2; } saved[MAX_SPLIT];
++   unsigned n = 0;
++
++   for (; jc && n < MAX_SPLIT; n++) {
++      volatile uint8_t *h = (volatile uint8_t *)(uintptr_t)jc;
++      saved[n].h = h;
++      saved[n].next = *(volatile uint64_t *)(h + 0x18);
++      saved[n].d1 = *(volatile uint16_t *)(h + 0x14);
++      saved[n].d2 = *(volatile uint16_t *)(h + 0x16);
++      *(volatile uint64_t *)(h + 0x18) = 0;
++      *(volatile uint16_t *)(h + 0x14) = 0;
++      *(volatile uint16_t *)(h + 0x16) = 0;
++
++      struct base_jd_atom_v2 *a = &atoms[n];
++      memset(a, 0, sizeof(*a));
++      a->jc = jc;
++      a->atom_number = next_atom;
++      next_atom = next_atom == 255 ? 1 : next_atom + 1;
++      a->core_req = BASE_JD_REQ_COHERENT_GROUP | BASE_JD_REQ_CS | BASE_JD_REQ_T;
++      if (n) {
++         a->pre_dep[0].atom_id = atoms[n - 1].atom_number;
++         a->pre_dep[0].dependency_type = 1; /* BASE_JD_DEP_TYPE_DATA */
++      }
++      jc = saved[n].next;
++   }
++   if (jc)
++      fprintf(stderr, "kbase-shim: chain longer than %u jobs!\n", MAX_SPLIT);
++   __sync_synchronize();
++
++   struct kbase_ioctl_job_submit js = { (uintptr_t)atoms, n, sizeof(atoms[0]) };
++   int ret = 0;
++   if (ioctl(kfd, KBASE_IOCTL_JOB_SUBMIT, &js) < 0) {
++      perror("kbase-shim: JOB_SUBMIT (split)");
++      ret = -1;
++   }
++   for (unsigned done = 0; !ret && done < n;) {
++      struct base_jd_event_v2 ev;
++      ssize_t r = read(kfd, &ev, sizeof(ev));
++      if (r < 0 && errno == EINTR)
++         continue;
++      if (r != sizeof(ev)) {
++         perror("kbase-shim: event read");
++         ret = -1;
++         break;
++      }
++      if (ev.event_code != BASE_JD_EVENT_DONE)
++         fprintf(stderr, "kbase-shim: split atom %u event 0x%x\n", ev.atom_number, ev.event_code);
++      done++;
++   }
++   dbg("split chain: %u atoms\n", n);
++
++   for (unsigned i = 0; i < n; i++) {
++      *(volatile uint64_t *)(saved[i].h + 0x18) = saved[i].next;
++      *(volatile uint16_t *)(saved[i].h + 0x14) = saved[i].d1;
++      *(volatile uint16_t *)(saved[i].h + 0x16) = saved[i].d2;
++   }
++   return ret;
++}
++
++static int
++kb_submit(int fd, unsigned long request, void *arg)
++{
++   struct drm_panfrost_submit *s = arg;
++   if (!getenv("KBASE_SHIM_NOSPLIT") && !(s->requirements & PANFROST_JD_REQ_FS))
++      return submit_split(s->jc, s->requirements);
++   return submit_one(s->jc, s->requirements);
++}
++
++static int
++submit_one(uint64_t jc, uint32_t reqs)
++{
++   struct { uint64_t jc; uint32_t requirements; } sub = { jc, reqs }, *s = &sub;
++   struct base_jd_atom_v2 atom = { 0 };
++
++   atom.jc = s->jc;
++   atom.atom_number = next_atom;
++   next_atom = next_atom == 255 ? 1 : next_atom + 1;
++   const char *vtreq = getenv("KBASE_SHIM_VTREQ");
++   atom.core_req = (s->requirements & PANFROST_JD_REQ_FS)
++                      ? BASE_JD_REQ_COHERENT_GROUP | BASE_JD_REQ_FS
++                      : (vtreq ? strtoul(vtreq, NULL, 0)
++                               : BASE_JD_REQ_COHERENT_GROUP | BASE_JD_REQ_CS | BASE_JD_REQ_T);
++
++   struct kbase_ioctl_job_submit js = { (uintptr_t)&atom, 1, sizeof(atom) };
++   if (ioctl(kfd, KBASE_IOCTL_JOB_SUBMIT, &js) < 0) {
++      perror("kbase-shim: JOB_SUBMIT");
++      return -1;
++   }
++
++   for (;;) {
++      struct base_jd_event_v2 ev;
++      ssize_t r = read(kfd, &ev, sizeof(ev));
++      if (r < 0 && errno == EINTR)
++         continue;
++      if (r != sizeof(ev)) {
++         perror("kbase-shim: event read");
++         return -1;
++      }
++      if (ev.atom_number != atom.atom_number)
++         continue;
++      if (ev.event_code != BASE_JD_EVENT_DONE)
++         fprintf(stderr, "kbase-shim: atom %u (jc %#llx, %s) event 0x%x\n",
++                 ev.atom_number, (unsigned long long)s->jc,
++                 (s->requirements & PANFROST_JD_REQ_FS) ? "FS" : "VT",
++                 ev.event_code);
++      else
++         dbg("atom %u (%s) done\n", ev.atom_number,
++             (s->requirements & PANFROST_JD_REQ_FS) ? "FS" : "VT");
++      peek(s->requirements & PANFROST_JD_REQ_FS ? "FS" : "VT");
++      if (0)
++         dbg("atom %u (%s) done\n", ev.atom_number,
++             (s->requirements & PANFROST_JD_REQ_FS) ? "FS" : "VT");
++      return 0;
++   }
++}
++
++static int
++kb_noop(int fd, unsigned long request, void *arg)
++{
++   return 0;
++}
++
++static int
++kb_madvise(int fd, unsigned long request, void *arg)
++{
++   struct drm_panfrost_madvise *m = arg;
++   m->retained = 1;
++   return 0;
++}
++
++static ioctl_fn_t kbase_driver_ioctls[] = {
++   [DRM_PANFROST_SUBMIT] = kb_submit,
++   [DRM_PANFROST_WAIT_BO] = kb_noop,
++   [DRM_PANFROST_CREATE_BO] = kb_create_bo,
++   [DRM_PANFROST_MMAP_BO] = kb_mmap_bo,
++   [DRM_PANFROST_GET_PARAM] = kb_get_param,
++   [DRM_PANFROST_GET_BO_OFFSET] = kb_get_bo_offset,
++   [DRM_PANFROST_MADVISE] = kb_madvise,
++};
++
++bool drm_shim_driver_prefers_first_render_node = true;
++
++void
++drm_shim_driver_init(void)
++{
++   if (kbase_open() < 0)
++      abort();
++
++   shim_device.bus_type = DRM_BUS_PLATFORM;
++   shim_device.driver_name = "panfrost";
++   shim_device.driver_ioctls = kbase_driver_ioctls;
++   shim_device.driver_ioctl_count = ARRAY_SIZE(kbase_driver_ioctls);
++   shim_device.driver_bo_free = kb_bo_free;
++   shim_device.version_major = 1;
++   shim_device.version_minor = 2;
++
++   drm_shim_override_file("DRIVER=panfrost\n"
++                          "OF_FULLNAME=/soc/mali\n"
++                          "OF_COMPATIBLE_0=arm,mali-t720\n"
++                          "OF_COMPATIBLE_N=1\n",
++                          "/sys/dev/char/%d:%d/device/uevent", DRM_MAJOR,
++                          render_node_minor);
++}
