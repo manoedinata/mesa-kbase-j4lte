@@ -58,6 +58,11 @@ Besides the files above, the stock vendor needs these changes (all in the
   Samsung H-VENDOR. The stock 32-bit binderized allocator service stays.
 - `build.prop`: `ro.hardware.egl=mesa`, `ro.opengles.version=131072`,
   `ro.hardware.gralloc=exynos7570`.
+- Optional, ES 3.0: `ro.opengles.version=196608` and
+  `mesa.gles.version.override=3.0` (`tests/gles3-override.sh on`). Not
+  conformant: T720 has one render target (`GL_MAX_DRAW_BUFFERS=1`). The key
+  must be the bare `mesa.*` form: Mesa builds the property name in a 32-byte
+  buffer, so `debug.`/`vendor.mesa.gles.version.override` are truncated.
 - `default.prop`: `ro.zygote=zygote64_32`. With `zygote32`, system_server dies
   at boot_completed because there is no secondary zygote.
 - SELinux label for all new libs: `u:object_r:same_process_hal_file:s0`.
@@ -73,6 +78,10 @@ clang (`aarch64-linux-android30-clang -fuse-ld=lld`) against the Mesa build:
 - `glstress.c`: draw-call throughput (`glstress [frames] [draws]`; `NOFINAL`/`NOCLEAR` env give correctness grids);
 - `hwbtest.c`: AHardwareBuffer allocate/lock/plane layout through the mapper;
 - `gralloc64/gralloc_test.c`: ION buffer, CPU write, GPU import, GPU clear, CPU readback.
+- `gles3test.c`: ES 3.0 feature probe (ESSL 3.00, integer/float textures, instancing,
+  transform feedback, UBO, array textures, MSAA, queries, primitive restart, MRT).
+  T720 is ES 2.0 by default; `tests/gles3-override.sh test` runs it with and without
+  `MESA_GLES_VERSION_OVERRIDE=3.0`. Build with `./build.sh tests`.
 
 ## Runtime knobs (libdrm-kbase)
 

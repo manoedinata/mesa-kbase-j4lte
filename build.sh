@@ -4,6 +4,7 @@
 #
 #   ./build.sh            download sources, build everything, stage out/vendor
 #   ./build.sh shell      open a shell in the build container
+#   ./build.sh tests      build tests/gles3test into out/tests (NDK must be unpacked)
 #
 # Needs: docker, ~1.5 GB download (NDK), ~4 GB disk. Everything goes to
 # $WORK (default ./work); the result goes to ./out.
@@ -47,6 +48,18 @@ docker build -q -t "$IMAGE" "$TOP/docker" >/dev/null
 if [ "${1:-}" = shell ]; then
     exec docker run --rm -it -u "$(id -u):$(id -g)" -v "$TOP:/src:ro" \
         -v "$WORK:/w" -v "$WORK/ndk:/ndk:ro" -v "$OUT:/out" -w /w "$IMAGE" bash
+fi
+
+if [ "${1:-}" = tests ]; then
+    # Test programs that need only the NDK (they load Mesa through the system
+    # libEGL on the phone). Run after a full build has unpacked the NDK.
+    echo "== tests -> out/tests"
+    run "
+mkdir -p /out/tests
+/ndk/android-ndk-r21e/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang \
+  -O2 -Wall -fuse-ld=lld -o /out/tests/gles3test /src/tests/gles3test.c -lEGL -lGLESv3
+"
+    exit 0
 fi
 
 fetch "$NDK_URL" "$NDK_ZIP" "$NDK_SHA256"

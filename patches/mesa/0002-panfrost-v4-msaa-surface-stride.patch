@@ -1,0 +1,30 @@
+From: mesa-kbase-j4lte
+Subject: [PATCH] panfrost: set SFBD writeback surface stride for MSAA (v4)
+
+The v4 single-target framebuffer descriptor uses layered MSAA (one surface
+per sample) but left Color/ZS Writeback "Surface Stride" at 0, so every
+sample landed on surface 0 and a 4x resolve returned 1/4 of the color.
+---
+--- a/src/panfrost/lib/pan_desc.c	2025-01-23 01:12:23.000000000 +0700
++++ b/src/panfrost/lib/pan_desc.c	2026-11-11 17:44:30.191282862 +0700
+@@ -967,6 +967,10 @@
+          cfg.color_writeback.base = surf.data;
+          cfg.color_writeback.row_stride =
+             image->layout.slices[level].row_stride;
++         /* Layered MSAA writes one surface per sample. */
++         if (pan_image_view_get_nr_samples(rt) > 1)
++            cfg.color_writeback.surface_stride =
++               image->layout.slices[level].surface_stride;
+ 
+          cfg.color_block_format = mod_to_block_fmt(image->layout.modifier);
+          assert(cfg.color_block_format == MALI_BLOCK_FORMAT_LINEAR ||
+@@ -994,6 +998,9 @@
+          cfg.zs_write_enable = !fb->zs.discard.z;
+          cfg.zs_writeback.base = surf.data;
+          cfg.zs_writeback.row_stride = image->layout.slices[level].row_stride;
++         if (pan_image_view_get_nr_samples(zs) > 1)
++            cfg.zs_writeback.surface_stride =
++               image->layout.slices[level].surface_stride;
+          cfg.zs_block_format = mod_to_block_fmt(image->layout.modifier);
+          assert(cfg.zs_block_format == MALI_BLOCK_FORMAT_LINEAR ||
+                 cfg.zs_block_format == MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED);
