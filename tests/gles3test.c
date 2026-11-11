@@ -514,17 +514,17 @@ int main(void)
 		;
 	printf("\n");
 
-	t_essl300();
-	t_int_rt();
-	t_float_tex();
-	t_instancing();
-	t_xfb();
-	t_ubo();
-	t_tex_array();
-	t_msaa();
-	t_occlusion();
-	t_prim_restart();
-	t_mrt();
+	/* GLES3TEST_ONLY=name runs one subtest (e.g. "mrt"), for tracing. */
+	static const struct { const char *n; void (*f)(void); } tests[] = {
+		{ "essl300", t_essl300 }, { "int_rt", t_int_rt }, { "float_tex", t_float_tex },
+		{ "instancing", t_instancing }, { "xfb", t_xfb }, { "ubo", t_ubo },
+		{ "tex_array", t_tex_array }, { "msaa", t_msaa }, { "occlusion", t_occlusion },
+		{ "prim_restart", t_prim_restart }, { "mrt", t_mrt },
+	};
+	const char *only = getenv("GLES3TEST_ONLY");
+	for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
+		if (!only || !strcmp(only, tests[i].n))
+			tests[i].f();
 
 	printf("\n%d failure(s)\n", fails);
 	return fails;
