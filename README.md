@@ -9,7 +9,7 @@ don't fit this kernel, so an arm64 Android ROM (GSI or a LineageOS build) has no
 
 | File (in `/vendor`) | What it is |
 |---|---|
-| `lib64/egl/libEGL_mesa.so`, `libGLESv1_CM_mesa.so`, `libGLESv2_mesa.so`, `lib64/libgallium_dri.so`, `lib64/libglapi.so` | Mesa 24.3.4, Panfrost Gallium driver, Android platform (OpenGL ES 2.0 on T720) |
+| `lib64/egl/libEGL_mesa.so`, `libGLESv1_CM_mesa.so`, `libGLESv2_mesa.so`, `lib64/libgallium_dri.so`, `lib64/libglapi.so` | Mesa 24.3.4, Panfrost Gallium driver, Android platform (OpenGL ES 3.0 on T720) |
 | `lib64/libdrm.so` | **libdrm-kbase**: a libdrm replacement that presents `/dev/mali0` (kbase) as a panfrost DRM render node |
 | `lib64/hw/gralloc.exynos7570.so` | 64-bit gralloc0 mapper module for Samsung's Mali gralloc3 buffers |
 | `lib64/libc++_shared.so` | from NDK r21e (Mesa needs it) |
@@ -58,11 +58,12 @@ Besides the files above, the stock vendor needs these changes (all in the
   Samsung H-VENDOR. The stock 32-bit binderized allocator service stays.
 - `build.prop`: `ro.hardware.egl=mesa`, `ro.opengles.version=131072`,
   `ro.hardware.gralloc=exynos7570`.
-- Optional, ES 3.0: `ro.opengles.version=196608` and
-  `mesa.gles.version.override=3.0` (`tests/gles3-override.sh on`). Not
-  conformant: T720 has one render target (`GL_MAX_DRAW_BUFFERS=1`). The key
-  must be the bare `mesa.*` form: Mesa builds the property name in a 32-byte
-  buffer, so `debug.`/`vendor.mesa.gles.version.override` are truncated.
+- For ES 3.0 apps: `ro.opengles.version=196608`. Mesa reports ES 3.0 on its
+  own since `patches/mesa/0003` (emulated multiple render targets, see
+  [docs/MRT-RE.md](docs/MRT-RE.md)). `mesa.gles.version.override` is no longer
+  needed; if used, the key must be the bare `mesa.*` form: Mesa builds the
+  property name in a 32-byte buffer, so the `debug.`/`vendor.` forms are
+  truncated.
 - `default.prop`: `ro.zygote=zygote64_32`. With `zygote32`, system_server dies
   at boot_completed because there is no secondary zygote.
 - SELinux label for all new libs: `u:object_r:same_process_hal_file:s0`.
@@ -80,8 +81,10 @@ clang (`aarch64-linux-android30-clang -fuse-ld=lld`) against the Mesa build:
 - `gralloc64/gralloc_test.c`: ION buffer, CPU write, GPU import, GPU clear, CPU readback.
 - `gles3test.c`: ES 3.0 feature probe (ESSL 3.00, integer/float textures, instancing,
   transform feedback, UBO, array textures, MSAA, queries, primitive restart, MRT).
-  T720 is ES 2.0 by default; `tests/gles3-override.sh test` runs it with and without
-  `MESA_GLES_VERSION_OVERRIDE=3.0`. Build with `./build.sh tests`.
+  `GLES3TEST_ONLY=<name>` runs one subtest.
+- `mrtprobe.c`: one MRT scenario per run (`draw`, `rt3`, `rt4`, `clear`, `clrdraw`,
+  `blend`, `depth`, `mixdepth`, `mixed2`, `int`, `sizes`, `level`, `msaa`).
+- Build both with `./build.sh tests`.
 
 ## Runtime knobs (libdrm-kbase)
 

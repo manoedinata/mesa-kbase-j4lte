@@ -3,8 +3,9 @@
 #
 # Mesa reads its env options from properties on Android
 # (src/util/os_misc.c: MESA_FOO_BAR -> debug.mesa.foo.bar), so no rebuild is
-# needed. T720 (Midgard v4) has one render target, so this is NOT conformant
-# ES 3.0: glDrawBuffers with more than one buffer fails (GL_MAX_DRAW_BUFFERS=1).
+# needed. Since patches/mesa/0003 (emulated MRT) Mesa reports ES 3.0 on T720
+# without any override; this script is still useful to force ES 3.1 or to
+# compare against a build without that patch.
 #
 #   tests/gles3-override.sh test   push + run tests/gles3test in a shell process only
 #   tests/gles3-override.sh on     system-wide: ES 3.0 for all 64-bit apps (reboot)

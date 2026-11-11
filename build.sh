@@ -4,7 +4,7 @@
 #
 #   ./build.sh            download sources, build everything, stage out/vendor
 #   ./build.sh shell      open a shell in the build container
-#   ./build.sh tests      build tests/gles3test into out/tests (NDK must be unpacked)
+#   ./build.sh tests      build tests/gles3test and tests/mrtprobe into out/tests (NDK must be unpacked)
 #
 # Needs: docker, ~1.5 GB download (NDK), ~4 GB disk. Everything goes to
 # $WORK (default ./work); the result goes to ./out.
@@ -58,6 +58,8 @@ if [ "${1:-}" = tests ]; then
 mkdir -p /out/tests
 /ndk/android-ndk-r21e/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang \
   -O2 -Wall -fuse-ld=lld -o /out/tests/gles3test /src/tests/gles3test.c -lEGL -lGLESv3
+/ndk/android-ndk-r21e/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang \
+  -O2 -Wall -fuse-ld=lld -o /out/tests/mrtprobe /src/tests/mrtprobe.c -lEGL -lGLESv3
 "
     exit 0
 fi

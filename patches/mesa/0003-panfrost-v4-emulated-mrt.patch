@@ -1,0 +1,903 @@
+From: mesa-kbase-j4lte
+Subject: [PATCH] panfrost: emulate up to 4 render targets on Midgard v4
+
+Midgard v4 (T720) only has the single-target framebuffer descriptor. Do
+what the Arm driver does for mixed-format MRT (docs/MRT-RE.md, path B):
+run the vertex/tiler work once and one fragment job per render target.
+Every draw gets one draw descriptor copy per RT, 128 bytes apart, each
+pointing at a fragment shader variant that writes only that RT (as RT0)
+with its blend state; pass i's SFBD selects copy i with "DCD Offset".
+All passes start from the same Z/S state and only the last writes it.
+---
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -476,13 +476,18 @@
+    pan_merge((*rsd), empty_rsd, RENDERER_STATE);
+ }
+ 
++/* `rt` is the render target whose blend state goes in the RSD. Only Midgard
++ * v4 uses it: the SFBD has one target, normally RT0, but each emulated MRT
++ * pass puts RT `rt` there (with fragment shader variant `fs`).
++ */
+ static void
+-panfrost_prepare_fs_state(struct panfrost_context *ctx, mali_ptr *blend_shaders,
++panfrost_prepare_fs_state(struct panfrost_context *ctx,
++                          struct panfrost_compiled_shader *fs, UNUSED unsigned rt,
++                          mali_ptr *blend_shaders,
+                           struct mali_renderer_state_packed *rsd)
+ {
+    struct pipe_rasterizer_state *rast = &ctx->rasterizer->base;
+    const struct panfrost_zsa_state *zsa = ctx->depth_stencil;
+-   struct panfrost_compiled_shader *fs = ctx->prog[PIPE_SHADER_FRAGMENT];
+    struct panfrost_blend_state *so = ctx->blend;
+    bool alpha_to_coverage = ctx->blend->base.alpha_to_coverage;
+    bool msaa = rast->multisample;
+@@ -534,19 +539,19 @@
+ 
+ #if PAN_ARCH == 4
+       if (rt_count > 0) {
+-         cfg.multisample_misc.load_destination = so->info[0].load_dest;
+-         cfg.multisample_misc.blend_shader = (blend_shaders[0] != 0);
+-         cfg.stencil_mask_misc.write_enable = so->info[0].enabled;
++         cfg.multisample_misc.load_destination = so->info[rt].load_dest;
++         cfg.multisample_misc.blend_shader = (blend_shaders[rt] != 0);
++         cfg.stencil_mask_misc.write_enable = so->info[rt].enabled;
+          cfg.stencil_mask_misc.srgb =
+-            util_format_is_srgb(ctx->pipe_framebuffer.cbufs[0]->format);
++            util_format_is_srgb(ctx->pipe_framebuffer.cbufs[rt]->format);
+          cfg.stencil_mask_misc.dither_disable = !so->base.dither;
+          cfg.stencil_mask_misc.alpha_to_one = so->base.alpha_to_one;
+ 
+-         if (blend_shaders[0]) {
+-            cfg.blend_shader = blend_shaders[0];
++         if (blend_shaders[rt]) {
++            cfg.blend_shader = blend_shaders[rt];
+          } else {
+             cfg.blend_constant = pan_blend_get_constant(
+-               so->info[0].constant_mask, ctx->blend_color.color);
++               so->info[rt].constant_mask, ctx->blend_color.color);
+          }
+       } else {
+          /* If there is no colour buffer, leaving fields default is
+@@ -611,24 +616,24 @@
+ 
+ static void
+ panfrost_emit_frag_shader(struct panfrost_context *ctx,
++                          struct panfrost_compiled_shader *fs, unsigned rt,
+                           struct mali_renderer_state_packed *fragmeta,
+                           mali_ptr *blend_shaders)
+ {
+    const struct panfrost_zsa_state *zsa = ctx->depth_stencil;
+    const struct panfrost_rasterizer *rast = ctx->rasterizer;
+-   struct panfrost_compiled_shader *fs = ctx->prog[PIPE_SHADER_FRAGMENT];
+ 
+    /* We need to merge several several partial renderer state descriptors,
+     * so stage to temporary storage rather than reading back write-combine
+     * memory, which will trash performance. */
+    struct mali_renderer_state_packed rsd;
+-   panfrost_prepare_fs_state(ctx, blend_shaders, &rsd);
++   panfrost_prepare_fs_state(ctx, fs, rt, blend_shaders, &rsd);
+ 
+ #if PAN_ARCH == 4
+-   if (ctx->pipe_framebuffer.nr_cbufs > 0 && !blend_shaders[0]) {
++   if (ctx->pipe_framebuffer.nr_cbufs > 0 && !blend_shaders[rt]) {
+       /* Word 14: SFBD Blend Equation */
+       STATIC_ASSERT(pan_size(BLEND_EQUATION) == 4);
+-      rsd.opaque[14] = ctx->blend->equation[0];
++      rsd.opaque[14] = ctx->blend->equation[rt];
+    }
+ #endif
+ 
+@@ -685,7 +690,8 @@
+    mali_ptr blend_shaders[PIPE_MAX_COLOR_BUFS] = {0};
+    panfrost_get_blend_shaders(batch, blend_shaders);
+ 
+-   panfrost_emit_frag_shader(ctx, (struct mali_renderer_state_packed *)xfer.cpu,
++   panfrost_emit_frag_shader(ctx, ctx->prog[PIPE_SHADER_FRAGMENT], 0,
++                             (struct mali_renderer_state_packed *)xfer.cpu,
+                              blend_shaders);
+ 
+ #if PAN_ARCH >= 5
+@@ -2967,6 +2973,110 @@
+    return vertex_count;
+ }
+ 
++#if PAN_ARCH == 4
++/* Midgard v4 emulated MRT: fragment varying descriptors of a per-RT variant.
++ * The vertex shader runs once for all passes, so the varying layout is the
++ * one linked against the full fragment shader; the variant may read only a
++ * subset of it.
++ */
++static mali_ptr
++panfrost_v4_mrt_emit_fs_varyings(struct panfrost_batch *batch,
++                                 struct panfrost_compiled_shader *vs,
++                                 struct panfrost_compiled_shader *full,
++                                 struct panfrost_compiled_shader *fs,
++                                 uint16_t point_coord_mask)
++{
++   struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
++   unsigned consumer_count = fs->info.varyings.input_count;
++
++   if (!consumer_count)
++      return 0;
++
++   signed offsets[PAN_MAX_VARYINGS];
++   unsigned present =
++      pan_varying_present(dev, &vs->info, &full->info, point_coord_mask);
++   pan_assign_varyings(dev, &vs->info, &full->info, offsets);
++
++   struct panfrost_ptr T =
++      pan_pool_alloc_desc_array(&batch->pool.base, consumer_count, ATTRIBUTE);
++   struct mali_attribute_packed *descs = T.cpu;
++
++   for (unsigned i = 0; i < consumer_count; ++i) {
++      signed j = pan_find_vary(vs->info.varyings.output,
++                               vs->info.varyings.output_count,
++                               fs->info.varyings.input[i].location);
++
++      panfrost_emit_varying(dev, descs + i, fs->info.varyings.input[i],
++                            fs->info.varyings.input[i].format, present,
++                            point_coord_mask, (j >= 0) ? offsets[j] : -1,
++                            PAN_VARY_FRAGCOORD);
++   }
++
++   return T.gpu;
++}
++
++/* Midgard v4 emulated MRT: emit the fragment-stage state of every render
++ * target pass for the current draw (RSD with RT i's blend, uniforms and
++ * varyings of fragment shader variant i). The draw descriptor copies built in
++ * pan_jm.c point at these.
++ */
++static void
++panfrost_v4_mrt_emit_passes(struct panfrost_batch *batch, bool points)
++{
++   struct panfrost_context *ctx = batch->ctx;
++   unsigned n = panfrost_batch_v4_mrt_passes(batch, PAN_ARCH);
++
++   if (!n)
++      return;
++
++   struct panfrost_compiled_shader *vars[PIPE_MAX_COLOR_BUFS];
++   panfrost_get_fs_variants_for_rts(ctx, n, vars);
++
++   struct panfrost_compiled_shader *vs = ctx->prog[PIPE_SHADER_VERTEX];
++   struct panfrost_compiled_shader *full = ctx->prog[PIPE_SHADER_FRAGMENT];
++   uint16_t point_coord_mask =
++      points ? ctx->rasterizer->base.sprite_coord_enable : 0;
++   struct panfrost_bo *blend_bo = NULL;
++   unsigned blend_offset = 0;
++
++   for (unsigned i = 0; i < n; ++i) {
++      memset(&batch->v4_mrt[i], 0, sizeof(batch->v4_mrt[i]));
++
++      /* No pass for a missing colour buffer: its draw descriptor copy is
++       * never selected by any FBD. */
++      if (!batch->key.cbufs[i])
++         continue;
++
++      struct panfrost_compiled_shader *fs = vars[i];
++
++      panfrost_batch_add_bo(batch, fs->bin.bo, PIPE_SHADER_FRAGMENT);
++      batch->stack_size = MAX2(batch->stack_size, fs->info.tls_size);
++
++      mali_ptr blend_shaders[PIPE_MAX_COLOR_BUFS] = {0};
++      blend_shaders[i] =
++         panfrost_get_blend_as_rt0(batch, i, &blend_bo, &blend_offset);
++
++      struct panfrost_ptr rsd =
++         pan_pool_alloc_desc(&batch->pool.base, RENDERER_STATE);
++      panfrost_emit_frag_shader(ctx, fs, i,
++                                (struct mali_renderer_state_packed *)rsd.cpu,
++                                blend_shaders);
++      batch->v4_mrt[i].rsd = rsd.gpu;
++
++      /* Uniforms and sysvals are laid out per variant */
++      unsigned nr_ubo, nr_push;
++      ctx->prog[PIPE_SHADER_FRAGMENT] = fs;
++      batch->v4_mrt[i].uniform_buffers = panfrost_emit_const_buf(
++         batch, PIPE_SHADER_FRAGMENT, &nr_ubo, &batch->v4_mrt[i].push_uniforms,
++         &nr_push);
++      ctx->prog[PIPE_SHADER_FRAGMENT] = full;
++
++      batch->v4_mrt[i].varyings =
++         panfrost_v4_mrt_emit_fs_varyings(batch, vs, full, fs, point_coord_mask);
++   }
++}
++#endif
++
+ static void
+ panfrost_single_draw_direct(struct panfrost_batch *batch,
+                             const struct pipe_draw_info *info,
+@@ -3020,6 +3130,9 @@
+                                     ctx->padded_count * ctx->instance_count,
+                                     info->mode == MESA_PRIM_POINTS);
+ #endif
++#if PAN_ARCH == 4
++   panfrost_v4_mrt_emit_passes(batch, info->mode == MESA_PRIM_POINTS);
++#endif
+ 
+    JOBX(launch_draw)(batch, info, drawid_offset, draw, vertex_count);
+    batch->draw_count++;
+--- a/src/gallium/drivers/panfrost/pan_context.c
++++ b/src/gallium/drivers/panfrost/pan_context.c
+@@ -147,6 +147,62 @@
+    ctx->dirty |= PAN_DIRTY_BLEND;
+ }
+ 
++/* Midgard v4 emulated MRT: blend shader for render target `rti`, compiled as
++ * RT0 because every RT pass writes its colour to the single SFBD target.
++ * Returns 0 if fixed-function blending can be used (same rules as
++ * panfrost_get_blend).
++ */
++mali_ptr
++panfrost_get_blend_as_rt0(struct panfrost_batch *batch, unsigned rti,
++                          struct panfrost_bo **bo, unsigned *shader_offset)
++{
++   struct panfrost_context *ctx = batch->ctx;
++   struct panfrost_device *dev = pan_device(ctx->base.screen);
++   struct panfrost_blend_state *blend = ctx->blend;
++   struct pan_blend_info info = blend->info[rti];
++   struct pipe_surface *surf = batch->key.cbufs[rti];
++   enum pipe_format fmt = surf->format;
++
++   if (info.fixed_function && dev->blendable_formats[fmt].internal &&
++       !blend->base.alpha_to_one &&
++       pan_blend_is_homogenous_constant(info.constant_mask,
++                                        ctx->blend_color.color)) {
++      return 0;
++   }
++
++   if (!info.enabled)
++      return 0;
++
++   struct pan_blend_state pan_blend = blend->pan;
++   unsigned nr_samples = surf->nr_samples ?: surf->texture->nr_samples;
++
++   pan_blend.rt_count = 1;
++   pan_blend.rts[0] = blend->pan.rts[rti];
++   pan_blend.rts[0].format = fmt;
++   pan_blend.rts[0].nr_samples = nr_samples;
++   memcpy(pan_blend.constants, ctx->blend_color.color,
++          sizeof(pan_blend.constants));
++
++   if (!(*bo)) {
++      *bo = panfrost_batch_create_bo(batch, 4096, PAN_BO_EXECUTE,
++                                     PIPE_SHADER_FRAGMENT, "Blend shader");
++   }
++
++   pthread_mutex_lock(&dev->blend_shaders.lock);
++   struct pan_blend_shader_variant *shader =
++      pan_screen(ctx->base.screen)
++         ->vtbl.get_blend_shader(&dev->blend_shaders, &pan_blend,
++                                 nir_type_float32, nir_type_float32, 0);
++
++   unsigned offset = *shader_offset;
++   assert((offset + shader->binary.size) < 4096);
++   memcpy((*bo)->ptr.cpu + offset, shader->binary.data, shader->binary.size);
++   *shader_offset += shader->binary.size;
++   pthread_mutex_unlock(&dev->blend_shaders.lock);
++
++   return ((*bo)->ptr.gpu + offset) | shader->first_tag;
++}
++
+ static void
+ panfrost_set_blend_color(struct pipe_context *pipe,
+                          const struct pipe_blend_color *blend_color)
+--- a/src/gallium/drivers/panfrost/pan_context.h
++++ b/src/gallium/drivers/panfrost/pan_context.h
+@@ -354,6 +354,11 @@
+    uint8_t clip_plane_enable;
+ 
+    bool line_smooth;
++
++   /* Midgard v4 emulated MRT: if nonzero, this variant writes only render
++    * target (v4_mrt_rt - 1), moved to RT0. One variant runs per RT pass.
++    */
++   uint8_t v4_mrt_rt;
+ };
+ 
+ struct panfrost_shader_key {
+@@ -458,6 +463,16 @@
+ 
+ bool panfrost_nir_remove_fragcolor_stores(nir_shader *s, unsigned nr_cbufs);
+ 
++bool panfrost_nir_select_rt(nir_shader *s, unsigned rt);
++
++void panfrost_get_fs_variants_for_rts(struct panfrost_context *ctx,
++                                      unsigned nr_rts,
++                                      struct panfrost_compiled_shader **out);
++
++mali_ptr panfrost_get_blend_as_rt0(struct panfrost_batch *batch, unsigned rti,
++                                   struct panfrost_bo **bo,
++                                   unsigned *shader_offset);
++
+ bool panfrost_nir_lower_sysvals(nir_shader *s, unsigned arch,
+                                 struct panfrost_sysvals *sysvals);
+ 
+--- a/src/gallium/drivers/panfrost/pan_fb_preload.c
++++ b/src/gallium/drivers/panfrost/pan_fb_preload.c
+@@ -1021,11 +1021,14 @@
+ }
+ #endif
+ 
++/* Must match PAN_V4_MRT_DCD_STRIDE in pan_job.h */
++#define V4_MRT_DCD_STRIDE 128
++
+ static void
+ pan_preload_emit_dcd(struct pan_fb_preload_cache *cache,
+                      struct pan_pool *pool, struct pan_fb_info *fb, bool zs,
+                      mali_ptr coordinates, mali_ptr tsd, void *out,
+-                     bool always_write)
++                     bool always_write, UNUSED bool cull_all)
+ {
+    unsigned tex_count = 0;
+    mali_ptr textures = pan_preload_emit_textures(pool, fb, zs, &tex_count);
+@@ -1075,6 +1078,11 @@
+ #if PAN_ARCH >= 6
+       cfg.clean_fragment_write = clean_fragment_write;
+ #endif
++
++      /* Placeholder draw for an emulated MRT pass that has nothing to
++       * preload: the triangle strip is culled, so nothing is shaded. */
++      cfg.cull_front_face = cull_all;
++      cfg.cull_back_face = cull_all;
+    }
+ #else
+    struct panfrost_ptr T;
+@@ -1189,7 +1197,7 @@
+    }
+ 
+    pan_preload_emit_dcd(cache, desc_pool, fb, zs, coords, tsd, dcd,
+-                        always_write);
++                        always_write, false);
+    if (zs) {
+       enum pipe_format fmt = fb->zs.view.zs
+                                 ? fb->zs.view.zs->planes[0]->layout.format
+@@ -1225,15 +1233,58 @@
+    }
+ }
+ #else
++/* With nr_passes > 1 (Midgard v4 emulated MRT), the job gets one draw
++ * descriptor per render target pass, V4_MRT_DCD_STRIDE bytes apart: Z/S
++ * preload draws are identical in every pass, colour preload draw i loads
++ * render target i only (as RT0), and passes with nothing to load get a culled
++ * placeholder draw.
++ */
+ static struct panfrost_ptr
+ pan_preload_emit_tiler_job(struct pan_fb_preload_cache *cache, struct pan_pool *desc_pool,
+                            struct pan_fb_info *fb, bool zs, mali_ptr coords,
+-                           mali_ptr tsd)
++                           mali_ptr tsd, unsigned nr_passes)
+ {
+-   struct panfrost_ptr job = pan_pool_alloc_desc(desc_pool, TILER_JOB);
++   struct panfrost_ptr job;
++
++   if (nr_passes > 1) {
++      job = pan_pool_alloc_aligned(
++         desc_pool, pan_size(TILER_JOB) + V4_MRT_DCD_STRIDE * (nr_passes - 1),
++         pan_alignment(TILER_JOB));
++      void *draw = pan_section_ptr(job.cpu, TILER_JOB, DRAW);
++
++      int any = -1;
++      for (unsigned i = 0; i < fb->rt_count && !zs; i++) {
++         if (fb->rts[i].preload) {
++            any = i;
++            break;
++         }
++      }
+ 
+-   pan_preload_emit_dcd(cache, desc_pool, fb, zs, coords, tsd,
+-                        pan_section_ptr(job.cpu, TILER_JOB, DRAW), false);
++      for (unsigned i = 0; i < nr_passes; i++) {
++         void *out = draw + V4_MRT_DCD_STRIDE * i;
++
++         if (zs) {
++            pan_preload_emit_dcd(cache, desc_pool, fb, true, coords, tsd, out,
++                                 false, false);
++            continue;
++         }
++
++         bool preload = i < fb->rt_count && fb->rts[i].preload;
++         struct pan_fb_info pass = *fb;
++         pass.rt_count = 1;
++         pass.rts[0] = fb->rts[preload ? i : any];
++         for (unsigned j = 1; j < ARRAY_SIZE(pass.rts); j++)
++            pass.rts[j] = (struct pan_fb_color_attachment){0};
++
++         pan_preload_emit_dcd(cache, desc_pool, &pass, false, coords, tsd, out,
++                              false, !preload);
++      }
++   } else {
++      job = pan_pool_alloc_desc(desc_pool, TILER_JOB);
++      pan_preload_emit_dcd(cache, desc_pool, fb, zs, coords, tsd,
++                           pan_section_ptr(job.cpu, TILER_JOB, DRAW), false,
++                           false);
++   }
+ 
+    pan_section_pack(job.cpu, TILER_JOB, PRIMITIVE, cfg) {
+       cfg.draw_mode = MALI_DRAW_MODE_TRIANGLE_STRIP;
+@@ -1255,14 +1306,15 @@
+ static struct panfrost_ptr
+ pan_preload_fb_part(struct pan_fb_preload_cache *cache, struct pan_pool *pool,
+                     struct pan_fb_info *fb, bool zs, mali_ptr coords,
+-                    mali_ptr tsd)
++                    mali_ptr tsd, UNUSED unsigned nr_passes)
+ {
+    struct panfrost_ptr job = {0};
+ 
+ #if PAN_ARCH >= 6
+    pan_preload_emit_pre_frame_dcd(cache, pool, fb, zs, coords, tsd);
+ #else
+-   job = pan_preload_emit_tiler_job(cache, pool, fb, zs, coords, tsd);
++   job = pan_preload_emit_tiler_job(cache, pool, fb, zs, coords, tsd,
++                                    nr_passes);
+ #endif
+    return job;
+ }
+@@ -1272,6 +1324,16 @@
+                      struct pan_fb_info *fb, mali_ptr tsd,
+                      struct panfrost_ptr *jobs)
+ {
++   return GENX(pan_preload_fb_passes)(cache, pool, fb, tsd, jobs, 1);
++}
++
++/* nr_passes > 1: Midgard v4 emulated MRT, see pan_preload_emit_tiler_job */
++unsigned
++GENX(pan_preload_fb_passes)(struct pan_fb_preload_cache *cache,
++                            struct pan_pool *pool, struct pan_fb_info *fb,
++                            mali_ptr tsd, struct panfrost_ptr *jobs,
++                            unsigned nr_passes)
++{
+    bool preload_zs = pan_preload_needed(fb, true);
+    bool preload_rts = pan_preload_needed(fb, false);
+    mali_ptr coords;
+@@ -1291,14 +1353,14 @@
+    unsigned njobs = 0;
+    if (preload_zs) {
+       struct panfrost_ptr job =
+-         pan_preload_fb_part(cache, pool, fb, true, coords, tsd);
++         pan_preload_fb_part(cache, pool, fb, true, coords, tsd, nr_passes);
+       if (jobs && job.cpu)
+          jobs[njobs++] = job;
+    }
+ 
+    if (preload_rts) {
+       struct panfrost_ptr job =
+-         pan_preload_fb_part(cache, pool, fb, false, coords, tsd);
++         pan_preload_fb_part(cache, pool, fb, false, coords, tsd, nr_passes);
+       if (jobs && job.cpu)
+          jobs[njobs++] = job;
+    }
+--- a/src/gallium/drivers/panfrost/pan_fb_preload.h
++++ b/src/gallium/drivers/panfrost/pan_fb_preload.h
+@@ -64,6 +64,12 @@
+                               struct pan_pool *desc_pool,
+                               struct pan_fb_info *fb, mali_ptr tsd,
+                               struct panfrost_ptr *jobs);
++
++unsigned GENX(pan_preload_fb_passes)(struct pan_fb_preload_cache *cache,
++                                     struct pan_pool *pool,
++                                     struct pan_fb_info *fb, mali_ptr tsd,
++                                     struct panfrost_ptr *jobs,
++                                     unsigned nr_passes);
+ #endif
+ 
+ #endif
+--- a/src/gallium/drivers/panfrost/pan_jm.c
++++ b/src/gallium/drivers/panfrost/pan_jm.c
+@@ -241,9 +241,10 @@
+    struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
+    struct panfrost_ptr preload_jobs[2];
+ 
+-   unsigned preload_job_count =
+-      GENX(pan_preload_fb)(&dev->fb_preload_cache, &batch->pool.base, fb,
+-                           batch->tls.gpu, preload_jobs);
++   unsigned passes = panfrost_batch_v4_mrt_passes(batch, PAN_ARCH);
++   unsigned preload_job_count = GENX(pan_preload_fb_passes)(
++      &dev->fb_preload_cache, &batch->pool.base, fb, batch->tls.gpu,
++      preload_jobs, MAX2(passes, 1));
+ 
+    assert(PAN_ARCH < 6 || !preload_job_count);
+ 
+@@ -253,10 +254,67 @@
+    }
+ }
+ 
++#if PAN_ARCH == 4
++/* Midgard v4 emulated MRT: one SFBD per colour buffer. Pass i renders RT i
++ * as its only target and selects draw descriptor copy i with the DCD offset.
++ * Every pass starts from the same Z/S state (clear or preload) and runs the
++ * same primitives, so all passes compute the same Z/S result; only the last
++ * pass writes it back. The first pass uses the batch FBD, which is also the
++ * one the draws point at for the tiler context and TLS.
++ */
++static void
++jm_emit_v4_mrt_fbds(struct panfrost_batch *batch, struct pan_fb_info *fb,
++                    struct pan_tls_info *tls, unsigned passes)
++{
++   int last = -1;
++
++   for (unsigned i = 0; i < passes; ++i) {
++      if (fb->rts[i].view)
++         last = i;
++   }
++
++   batch->v4_mrt_nr_fbd = 0;
++
++   for (unsigned i = 0; i < passes; ++i) {
++      if (!fb->rts[i].view && !(last < 0 && i == 0))
++         continue;
++
++      struct pan_fb_info pass = *fb;
++      pass.rt_count = fb->rts[i].view ? 1 : 0;
++      pass.rts[0] = fb->rts[i];
++      for (unsigned j = 1; j < ARRAY_SIZE(pass.rts); j++)
++         pass.rts[j] = (struct pan_fb_color_attachment){0};
++      pass.sfbd_dcd_offset = PAN_V4_MRT_DCD_STRIDE * i;
++
++      if ((int)i != last && last >= 0) {
++         pass.zs.discard.z = true;
++         pass.zs.discard.s = true;
++      }
++
++      struct panfrost_ptr fbd =
++         batch->v4_mrt_nr_fbd ? pan_pool_alloc_desc(&batch->pool.base, FRAMEBUFFER)
++                              : batch->framebuffer;
++
++      mali_ptr tag =
++         GENX(pan_emit_fbd)(&pass, 0, tls, &batch->tiler_ctx, fbd.cpu);
++      batch->v4_mrt_fbd[batch->v4_mrt_nr_fbd++] = fbd.gpu | tag;
++   }
++}
++#endif
++
+ void
+ GENX(jm_emit_fbds)(struct panfrost_batch *batch, struct pan_fb_info *fb,
+                    struct pan_tls_info *tls)
+ {
++#if PAN_ARCH == 4
++   unsigned passes = panfrost_batch_v4_mrt_passes(batch, PAN_ARCH);
++
++   if (passes) {
++      jm_emit_v4_mrt_fbds(batch, fb, tls, passes);
++      return;
++   }
++#endif
++
+    batch->framebuffer.gpu |= GENX(pan_emit_fbd)(
+       fb, 0, tls, &batch->tiler_ctx, batch->framebuffer.cpu);
+ }
+@@ -265,6 +323,35 @@
+ GENX(jm_emit_fragment_job)(struct panfrost_batch *batch,
+                            const struct pan_fb_info *pfb)
+ {
++#if PAN_ARCH == 4
++   /* Emulated MRT: a chain of fragment jobs, one per pass, all reading the
++    * same polygon list. */
++   if (panfrost_batch_v4_mrt_passes(batch, PAN_ARCH)) {
++      unsigned n = batch->v4_mrt_nr_fbd;
++      struct panfrost_ptr jobs[PIPE_MAX_COLOR_BUFS];
++
++      /* Allocated one by one: job descriptors are 64-byte aligned, the
++       * FRAGMENT_JOB size (48) is not. */
++      for (unsigned k = 0; k < n; ++k)
++         jobs[k] = pan_pool_alloc_desc(&batch->pool.base, FRAGMENT_JOB);
++
++      for (unsigned k = 0; k < n; ++k) {
++         GENX(pan_emit_fragment_job_payload)(pfb, batch->v4_mrt_fbd[k],
++                                             jobs[k].cpu);
++
++         pan_section_pack(jobs[k].cpu, FRAGMENT_JOB, HEADER, header) {
++            header.type = MALI_JOB_TYPE_FRAGMENT;
++            header.index = k + 1;
++            if (k + 1 < n)
++               header.next = jobs[k + 1].gpu;
++         }
++      }
++
++      batch->jm.jobs.frag = jobs[0].gpu;
++      return;
++   }
++#endif
++
+    struct panfrost_ptr transfer =
+       pan_pool_alloc_desc(&batch->pool.base, FRAGMENT_JOB);
+ 
+@@ -812,6 +899,50 @@
+ }
+ #endif
+ 
++#if PAN_ARCH == 4
++/* Midgard v4 emulated MRT: fill draw descriptor copy i (at the DRAW section +
++ * i * PAN_V4_MRT_DCD_STRIDE) with pass i's fragment state. Occlusion queries
++ * are only counted in the first pass.
++ */
++static void
++jm_emit_v4_mrt_draw_copies(struct panfrost_batch *batch, void *job,
++                           enum mesa_prim prim, unsigned passes)
++{
++   struct panfrost_context *ctx = batch->ctx;
++   void *draw = pan_section_ptr(job, TILER_JOB, DRAW);
++   mali_ptr rsd = batch->rsd[PIPE_SHADER_FRAGMENT];
++   mali_ptr ubo = batch->uniform_buffers[PIPE_SHADER_FRAGMENT];
++   mali_ptr push = batch->push_uniforms[PIPE_SHADER_FRAGMENT];
++   mali_ptr vary = batch->varyings.fs;
++   struct panfrost_query *oq = ctx->occlusion_query;
++   bool first = true;
++
++   for (unsigned i = 0; i < passes; ++i) {
++      if (!batch->key.cbufs[i])
++         continue;
++
++      batch->rsd[PIPE_SHADER_FRAGMENT] = batch->v4_mrt[i].rsd;
++      batch->uniform_buffers[PIPE_SHADER_FRAGMENT] =
++         batch->v4_mrt[i].uniform_buffers;
++      batch->push_uniforms[PIPE_SHADER_FRAGMENT] =
++         batch->v4_mrt[i].push_uniforms;
++      batch->varyings.fs = batch->v4_mrt[i].varyings;
++      if (!first)
++         ctx->occlusion_query = NULL;
++
++      jm_emit_tiler_draw(draw + PAN_V4_MRT_DCD_STRIDE * i, batch, true, prim);
++
++      ctx->occlusion_query = oq;
++      first = false;
++   }
++
++   batch->rsd[PIPE_SHADER_FRAGMENT] = rsd;
++   batch->uniform_buffers[PIPE_SHADER_FRAGMENT] = ubo;
++   batch->push_uniforms[PIPE_SHADER_FRAGMENT] = push;
++   batch->varyings.fs = vary;
++}
++#endif
++
+ #if PAN_ARCH <= 7
+ static void
+ jm_emit_tiler_job(struct panfrost_batch *batch,
+@@ -841,6 +972,12 @@
+ 
+    jm_emit_tiler_draw(pan_section_ptr(job, TILER_JOB, DRAW), batch, true, prim);
+ 
++#if PAN_ARCH == 4
++   unsigned passes = panfrost_batch_v4_mrt_passes(batch, PAN_ARCH);
++   if (passes)
++      jm_emit_v4_mrt_draw_copies(batch, job, prim, passes);
++#endif
++
+    panfrost_emit_primitive_size(ctx, prim == MESA_PRIM_POINTS,
+                                 batch->varyings.psiz, prim_size);
+ }
+@@ -962,7 +1099,17 @@
+ #endif
+    } else {
+       vertex = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+-      tiler = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
++#if PAN_ARCH == 4
++      /* Emulated MRT: room for one draw descriptor copy per pass */
++      unsigned passes = panfrost_batch_v4_mrt_passes(batch, PAN_ARCH);
++      if (passes) {
++         tiler = pan_pool_alloc_aligned(
++            &batch->pool.base,
++            pan_size(TILER_JOB) + PAN_V4_MRT_DCD_STRIDE * (passes - 1),
++            pan_alignment(TILER_JOB));
++      } else
++#endif
++         tiler = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
+    }
+ 
+ #if PAN_ARCH == 9
+--- a/src/gallium/drivers/panfrost/pan_job.h
++++ b/src/gallium/drivers/panfrost/pan_job.h
+@@ -189,6 +189,19 @@
+       mali_ptr psiz;
+    } varyings;
+ 
++   /* Midgard v4 emulated MRT (more than one colour buffer on the SFBD):
++    * fragment-stage state of each render target pass for the current draw.
++    * Every draw gets one draw descriptor per pass, 128 bytes apart; pass i's
++    * FBD selects copy i through its DCD offset.
++    */
++   struct {
++      mali_ptr rsd, uniform_buffers, push_uniforms, varyings;
++   } v4_mrt[PIPE_MAX_COLOR_BUFS];
++
++   /* Tagged FBD pointers of the emulated MRT passes, in submission order */
++   mali_ptr v4_mrt_fbd[PIPE_MAX_COLOR_BUFS];
++   unsigned v4_mrt_nr_fbd;
++
+    /* Index array */
+    mali_ptr indices;
+ 
+@@ -305,4 +318,14 @@
+    return batch->draw_count > 0 || batch->clear;
+ }
+ 
++/* Midgard v4 emulated MRT: number of render target passes (and of draw
++ * descriptor copies per draw), or 0 when the batch is single-pass. */
++#define PAN_V4_MRT_DCD_STRIDE 128
++
++static inline unsigned
++panfrost_batch_v4_mrt_passes(const struct panfrost_batch *batch, unsigned arch)
++{
++   return (arch == 4 && batch->key.nr_cbufs > 1) ? batch->key.nr_cbufs : 0;
++}
++
+ #endif
+--- a/src/gallium/drivers/panfrost/pan_nir_remove_fragcolor_stores.c
++++ b/src/gallium/drivers/panfrost/pan_nir_remove_fragcolor_stores.c
+@@ -48,3 +48,57 @@
+    return nir_shader_intrinsics_pass(
+       s, pass, nir_metadata_control_flow, &nr_cbufs);
+ }
++
++/* Midgard v4 emulated MRT: keep only the colour output of render target `rt`
++ * and move it to RT0 (DATA0). Stores to other render targets are removed and
++ * framebuffer fetches from them read zero. Depth, stencil and sample mask
++ * outputs are untouched.
++ */
++static bool
++select_rt_pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   unsigned rt = *(unsigned *)data;
++   bool store = intr->intrinsic == nir_intrinsic_store_output;
++   bool load = intr->intrinsic == nir_intrinsic_load_output;
++
++   if (!store && !load)
++      return false;
++
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   if (sem.location < FRAG_RESULT_DATA0)
++      return false;
++
++   if (sem.location - FRAG_RESULT_DATA0 == rt) {
++      sem.location = FRAG_RESULT_DATA0;
++      nir_intrinsic_set_io_semantics(intr, sem);
++      return true;
++   }
++
++   if (store) {
++      nir_instr_remove(&intr->instr);
++   } else {
++      b->cursor = nir_before_instr(&intr->instr);
++      nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components,
++                                               intr->def.bit_size));
++   }
++   return true;
++}
++
++bool
++panfrost_nir_select_rt(nir_shader *s, unsigned rt)
++{
++   const uint64_t data_mask = ~BITFIELD64_MASK(FRAG_RESULT_DATA0);
++   bool progress = nir_shader_intrinsics_pass(
++      s, select_rt_pass, nir_metadata_control_flow, &rt);
++
++   uint64_t written = s->info.outputs_written;
++   uint64_t read = s->info.outputs_read;
++   s->info.outputs_written &= ~data_mask;
++   s->info.outputs_read &= ~data_mask;
++   if (written & BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt))
++      s->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
++   if (read & BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt))
++      s->info.outputs_read |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
++
++   return progress;
++}
+--- a/src/gallium/drivers/panfrost/pan_screen.c
++++ b/src/gallium/drivers/panfrost/pan_screen.c
+@@ -151,7 +151,12 @@
+    case PIPE_CAP_DEPTH_CLIP_DISABLE_SEPARATE:
+       return dev->arch < 9;
+ 
++   /* Midgard v4 has a single render target in hardware (SFBD). Up to 4
++    * are emulated with one fragment pass per render target, like the Arm
++    * driver does for mixed formats (see pan_jm.c). */
+    case PIPE_CAP_MAX_RENDER_TARGETS:
++      return has_mrt ? 8 : (dev->arch == 4 ? 4 : 1);
++
+    case PIPE_CAP_FBFETCH:
+    case PIPE_CAP_FBFETCH_COHERENT:
+       return has_mrt ? 8 : 1;
+--- a/src/gallium/drivers/panfrost/pan_shader.c
++++ b/src/gallium/drivers/panfrost/pan_shader.c
+@@ -141,6 +141,9 @@
+                     key->fs.nr_cbufs_for_fragcolor);
+       }
+ 
++      if (key->fs.v4_mrt_rt)
++         NIR_PASS_V(s, panfrost_nir_select_rt, key->fs.v4_mrt_rt - 1);
++
+       if (key->fs.sprite_coord_enable) {
+          NIR_PASS_V(s, nir_lower_texcoord_replace_late,
+                     key->fs.sprite_coord_enable,
+@@ -305,6 +308,63 @@
+    return prog;
+ }
+ 
++/* Midgard v4 emulated MRT: get the fragment shader variant of every render
++ * target pass (variant i writes only RT i, as RT0). Creating variants can
++ * reallocate the variant array, so ctx->prog[FRAGMENT] is re-pointed and all
++ * results are resolved only after every variant exists.
++ */
++void
++panfrost_get_fs_variants_for_rts(struct panfrost_context *ctx, unsigned nr_rts,
++                                 struct panfrost_compiled_shader **out)
++{
++   struct panfrost_uncompiled_shader *uncompiled =
++      ctx->uncompiled[PIPE_SHADER_FRAGMENT];
++   int idx[PIPE_MAX_COLOR_BUFS];
++
++   assert(nr_rts <= PIPE_MAX_COLOR_BUFS);
++   simple_mtx_lock(&uncompiled->lock);
++
++   struct panfrost_compiled_shader *base = util_dynarray_begin(&uncompiled->variants);
++   ptrdiff_t cur = ctx->prog[PIPE_SHADER_FRAGMENT]
++                      ? ctx->prog[PIPE_SHADER_FRAGMENT] - base
++                      : -1;
++
++   for (unsigned rt = 0; rt < nr_rts; ++rt) {
++      struct panfrost_shader_key key = {0};
++      panfrost_build_key(ctx, &key, uncompiled);
++
++      enum pipe_format fmt = key.fs.rt_formats[rt];
++      memset(key.fs.rt_formats, 0, sizeof(key.fs.rt_formats));
++      key.fs.rt_formats[0] = fmt;
++      key.fs.v4_mrt_rt = rt + 1;
++
++      idx[rt] = -1;
++      unsigned n = 0;
++      util_dynarray_foreach(&uncompiled->variants,
++                            struct panfrost_compiled_shader, so) {
++         if (memcmp(&key, &so->key, sizeof(key)) == 0) {
++            idx[rt] = n;
++            break;
++         }
++         n++;
++      }
++
++      if (idx[rt] < 0) {
++         panfrost_new_variant_locked(ctx, uncompiled, &key);
++         idx[rt] = util_dynarray_num_elements(&uncompiled->variants,
++                                              struct panfrost_compiled_shader) - 1;
++      }
++   }
++
++   base = util_dynarray_begin(&uncompiled->variants);
++   if (cur >= 0)
++      ctx->prog[PIPE_SHADER_FRAGMENT] = base + cur;
++   for (unsigned rt = 0; rt < nr_rts; ++rt)
++      out[rt] = base + idx[rt];
++
++   simple_mtx_unlock(&uncompiled->lock);
++}
++
+ static void
+ panfrost_bind_shader_state(struct pipe_context *pctx, void *hwcso,
+                            enum pipe_shader_type type)
+--- a/src/panfrost/lib/pan_desc.c
++++ b/src/panfrost/lib/pan_desc.c
+@@ -919,6 +919,7 @@
+       cfg.dithering_enable = true;
+       cfg.clean_pixel_write_enable = true;
+       cfg.tie_break_rule = MALI_TIE_BREAK_RULE_MINUS_180_IN_0_OUT;
++      cfg.dcd_offset = fb->sfbd_dcd_offset;
+       if (fb->rts[0].clear) {
+          cfg.clear_color_0 = fb->rts[0].clear_value[0];
+          cfg.clear_color_1 = fb->rts[0].clear_value[1];
+--- a/src/panfrost/lib/pan_desc.h
++++ b/src/panfrost/lib/pan_desc.h
+@@ -147,6 +147,13 @@
+    /* Only used on Valhall */
+    bool sprite_coord_origin;
+    bool first_provoking_vertex;
++
++   /* Only used on Midgard v4 (SFBD): byte offset added to every draw
++    * descriptor pointer read from the polygon list. Emulated multiple render
++    * targets render one pass per RT, each pass selecting its own copy of the
++    * draw descriptors (see pan_jm.c).
++    */
++   unsigned sfbd_dcd_offset;
+ };
+ 
+ static inline unsigned
