@@ -85,6 +85,9 @@ clang (`aarch64-linux-android30-clang -fuse-ld=lld`) against the Mesa build:
 - `mrtprobe.c`: one MRT scenario per run (`draw`, `rt3`, `rt4`, `clear`, `clrdraw`,
   `blend`, `depth`, `mixdepth`, `mixed2`, `int`, `sizes`, `level`, `msaa`).
 - Build both with `./build.sh tests`.
+- `webgl2/index.html`: WebGL2 page (context info, 2-target MRT readback, animated
+  depth-tested scene) for the browser: serve it with `python3 -m http.server 8765`,
+  `adb reverse tcp:8765 tcp:8765`, open `http://localhost:8765/` in Jelly.
 
 ## Runtime knobs (libdrm-kbase)
 

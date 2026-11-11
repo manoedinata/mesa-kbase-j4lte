@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebGL2 probe</title>
+<style>
+  body { font: 15px/1.4 monospace; margin: 12px; background: #fff; color: #000; }
+  canvas { width: 100%; max-width: 360px; aspect-ratio: 1; border: 1px solid #888; display: block; }
+  .ok { color: #070; } .bad { color: #b00; }
+</style>
+</head>
+<body>
+<!-- WebGL2 probe for Mesa Panfrost on Mali-T720: context info, a 2-target MRT
+     render with readback, and an animated depth-tested scene. Results are
+     printed below and in document.title (PASS/FAIL). -->
+<div id="out"></div>
+<canvas id="c" width="256" height="256"></canvas>
+<script>
+const out = document.getElementById('out');
+let fails = 0;
+function log(msg, ok) {
+  const d = document.createElement('div');
+  if (ok !== undefined) { d.className = ok ? 'ok' : 'bad'; if (!ok) fails++; }
+  d.textContent = msg;
+  out.appendChild(d);
+}
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true });
+if (!gl) {
+  log('no WebGL2 context', false);
+  document.title = 'FAIL no webgl2';
+} else {
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  log('renderer: ' + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)));
+  log('version: ' + gl.getParameter(gl.VERSION));
+  log('MAX_DRAW_BUFFERS: ' + gl.getParameter(gl.MAX_DRAW_BUFFERS), gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 4);
+  log('MAX_COLOR_ATTACHMENTS: ' + gl.getParameter(gl.MAX_COLOR_ATTACHMENTS));
+
+  function prog(vs, fs) {
+    const p = gl.createProgram();
+    for (const [t, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+      const s = gl.createShader(t);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) log('compile: ' + gl.getShaderInfoLog(s), false);
+      gl.attachShader(p, s);
+    }
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) log('link: ' + gl.getProgramInfoLog(p), false);
+    return p;
+  }
+
+  // 1. MRT: two RGBA8 textures, one draw, read both back.
+  const W = 64;
+  const tex = [0, 1].map(() => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, W, W);
+    return t;
+  });
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  tex.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0));
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  log('MRT FBO status: 0x' + gl.checkFramebufferStatus(gl.FRAMEBUFFER).toString(16),
+      gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE);
+  const quadVs = `#version 300 es
+    void main() {
+      vec2 p = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)) * 2.0 - 1.0;
+      gl_Position = vec4(p, 0.0, 1.0);
+    }`;
+  const mrt = prog(quadVs, `#version 300 es
+    precision mediump float;
+    layout(location = 0) out vec4 a;
+    layout(location = 1) out vec4 b;
+    void main() { a = vec4(1.0, 0.5, 0.0, 1.0); b = vec4(0.0, 0.25, 1.0, 1.0); }`);
+  gl.viewport(0, 0, W, W);
+  gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 1]);
+  gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, 1]);
+  gl.useProgram(mrt);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  const want = [[255, 128, 0, 255], [0, 64, 255, 255]];
+  for (let i = 0; i < 2; i++) {
+    const px = new Uint8Array(4);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0 + i);
+    gl.readPixels(W / 2, W / 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const ok = px.every((v, k) => Math.abs(v - want[i][k]) <= 2);
+    log(`MRT RT${i} = ${Array.from(px).join(',')} want ${want[i].join(',')}`, ok);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // 2. Animated scene: instanced cubes, depth test, the MRT textures sampled.
+  const scene = prog(`#version 300 es
+    uniform float t;
+    out vec3 col;
+    out vec2 uv;
+    const vec3 v[8] = vec3[](vec3(-1,-1,-1), vec3(1,-1,-1), vec3(-1,1,-1), vec3(1,1,-1),
+                             vec3(-1,-1,1), vec3(1,-1,1), vec3(-1,1,1), vec3(1,1,1));
+    const int idx[36] = int[](0,1,2, 2,1,3, 4,6,5, 5,6,7, 0,2,4, 4,2,6,
+                              1,5,3, 3,5,7, 0,4,1, 1,4,5, 2,3,6, 6,3,7);
+    void main() {
+      vec3 p = v[idx[gl_VertexID]] * 0.18;
+      float a = t + float(gl_InstanceID) * 0.7;
+      mat3 r = mat3(cos(a), 0, sin(a), 0, 1, 0, -sin(a), 0, cos(a)) *
+               mat3(1, 0, 0, 0, cos(a * 0.6), -sin(a * 0.6), 0, sin(a * 0.6), cos(a * 0.6));
+      p = r * p;
+      vec2 off = vec2(float(gl_InstanceID % 3) - 1.0, float(gl_InstanceID / 3) - 1.0) * 0.6;
+      gl_Position = vec4(p.xy + off, p.z * 0.5 + 0.5, 1.0);
+      col = abs(v[idx[gl_VertexID]]) * 0.5 + 0.5;
+      uv = v[idx[gl_VertexID]].xy * 0.5 + 0.5;
+    }`, `#version 300 es
+    precision mediump float;
+    uniform sampler2D m0, m1;
+    in vec3 col;
+    in vec2 uv;
+    out vec4 o;
+    void main() { o = vec4(col, 1.0) * mix(texture(m0, uv), texture(m1, uv), uv.x); }`);
+  gl.useProgram(scene);
+  gl.uniform1i(gl.getUniformLocation(scene, 'm0'), 0);
+  gl.uniform1i(gl.getUniformLocation(scene, 'm1'), 1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex[0]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tex[1]);
+  for (const t of tex) {
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
+  gl.enable(gl.DEPTH_TEST);
+  const tl = gl.getUniformLocation(scene, 't');
+  let frames = 0, t0 = performance.now();
+  const fpsLine = document.createElement('div');
+  out.appendChild(fpsLine);
+  function frame(now) {
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0.1, 0.1, 0.15, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniform1f(tl, now / 1000);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 36, 9);
+    frames++;
+    if (now - t0 > 1000) {
+      fpsLine.textContent = 'fps: ' + (frames * 1000 / (now - t0)).toFixed(1) + '  gl error: ' + gl.getError();
+      frames = 0; t0 = now;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  const err = gl.getError();
+  log('gl error after setup: ' + err, err === 0);
+  document.title = (fails ? 'FAIL ' : 'PASS ') + fails;
+}
+</script>
+</body>
+</html>
